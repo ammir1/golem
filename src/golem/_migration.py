@@ -4,7 +4,7 @@ import numba as nb
 
 import ctypes
 # Load the library
-fsm_lib = ctypes.CDLL('./libEikonal.so')  # Change to .dll or .dylib if needed
+fsm_lib = ctypes.CDLL('../../lib/libEikonal.so')  # Change to .dll or .dylib if needed
 
 # Set argument types
 fsm_lib.fast_sweeping_method.argtypes = [

@@ -3,8 +3,6 @@ from matplotlib import gridspec
 import numpy as np
 import pandas as pd
 
-
-
 def plot_seismic_image(context, xlabel, ylabel, y_spacing, x_header, perc, key="data", xlim=None, ylim=None):
     data = context.get(key)
     df = context.get("geometry")
