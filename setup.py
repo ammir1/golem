@@ -20,5 +20,5 @@ setup(
         'numba'
     ],
     author='Ammir Ayman Karsou',
-    description='Seismic processing toolkit',
+    description='Seismic Processing Toolkit',
 )

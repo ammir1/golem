@@ -185,7 +185,7 @@ def plot_spectrum(context, key="data", dt=1.0):
         if wavelet.ndim == 1:
             ax0.plot(t, wavelet, color='b', label="Wavelet")
         else:
-            ax0.imshow(wavelet, aspect='auto', cmap='gray', extent=[0, wavelet.shape[1], t[-1], t[0]])
+            ax0.imshow(wavelet, aspect='auto', cmap='gray_r', extent=[0, wavelet.shape[1], t[-1], t[0]])
         ax0.set_xlabel('Time' if wavelet.ndim == 1 else 'Trace')
         ax0.set_ylabel('Amplitude' if wavelet.ndim == 1 else 'Time (ms)')
         ax0.set_title('Wavelet in Time Domain')

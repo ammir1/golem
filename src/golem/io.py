@@ -2,7 +2,7 @@ import os
 import numpy as np
 import pandas as pd
 
-def read_data(context, file_path, format="binary", shape=None):
+def read_data(context, file_path, format="binary", order='C', shape=None):
     if not os.path.isfile(file_path):
         print(f"❌ Error: File not found — {file_path}")
         return None
@@ -18,7 +18,7 @@ def read_data(context, file_path, format="binary", shape=None):
             if shape is None:
                 print("❌ Error: 'shape' must be provided for binary files.")
                 return None
-            data = np.fromfile(file_path, dtype=np.float32).reshape(shape, order='F')
+            data = np.fromfile(file_path, dtype=np.float32).reshape(shape, order=order)
         else:
             return None
 

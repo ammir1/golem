@@ -5,6 +5,9 @@ import os
 import inspect
 import re
 import pylops
+import cupy as cp
+
+
 
 def create_header(context, header_name, expression):
     df = context.get("geometry")
@@ -276,33 +279,70 @@ def calculate_convolution_operator(context, key="data", threshold_ratio=0.002):
     except Exception as e:
         print(f"❌ Failed to create convolution operator: {e}")
         return None
-def apply_designature(context, wavelet_key="wavelet", data_key="data"):
-    wavelet = context.get(wavelet_key)
+    
+def free_gpu_memory(func):
+    def wrapper_func(*args, **kwargs):
+        retval = func(*args, **kwargs)
+        cp._default_memory_pool.free_all_blocks()
+        return retval
+    return wrapper_func
+
+@free_gpu_memory
+def apply_designature(context, key_input="wavelet_input", key_output="wavelet_output", data_key="data", mode="cpu"):
+    wavelet_in = context.get(key_input)
+    wavelet_out = context.get(key_output)
     data = context.get(data_key)
-    operator = context.get("operator")
-    if wavelet is None or data is None:
+    # operator = context.get("operator")
+    if wavelet_out is None or data is None:
         print("❌ Error: wavelet or data not found in context.")
         return None
 
     try:
-        wavelet_cut, offset = find_wavelet_main_lobe_center(wavelet)
-
+        
         if data.ndim == 1:
-            Cop = pylops.signalprocessing.Convolve1D(len(data), h=wavelet_cut, offset=offset)
-            reflectivity = operator / data
-            modeled = Cop @ reflectivity
-            print("✅ 1D designature applied using operator inversion.")
-            return modeled
+            print("Entrei aqui")
+            # Cop_out = pylops.signalprocessing.Convolve1D(len(data), h=wavelet_cut, offset=offset)
+            # reflectivity = operator / data
+            # modeled = Cop @ reflectivity
+            # print("✅ 1D designature applied using operator inversion.")
+            # return modeled
 
         elif data.ndim == 2:
             n_samples, n_traces = data.shape
             modeled = np.zeros_like(data)
-            for i in range(n_traces):
-                Cop = pylops.signalprocessing.Convolve1D(n_samples, h=wavelet_cut, offset=offset)
-                reflectivity = operator / data[:, i]
-                modeled[:, i] = Cop @ reflectivity
-            print("✅ 2D designature applied trace-by-trace using operator inversion.")
-            return modeled
+
+            wavelet_in_cut, offset_in = find_wavelet_main_lobe_center(wavelet_in)
+            wavelet_out_cut, offset_out = find_wavelet_main_lobe_center(wavelet_out)
+
+           
+            if mode == "gpu":
+
+                wavelet_in_cut_gpu = cp.array(wavelet_in_cut)
+                wavelet_out_cut_gpu = cp.array(wavelet_out_cut)
+                data_gpu = cp.array(data)
+
+                Cop_in = pylops.signalprocessing.Convolve1D(dims=[n_samples,n_traces], h=wavelet_in_cut_gpu, offset=offset_in, axis=0, dtype='float32')
+                Cop_out = pylops.signalprocessing.Convolve1D(dims=[n_samples,n_traces], h=wavelet_out_cut_gpu, offset=offset_out, axis=0, dtype='float32')
+            
+                reflectivity_gpu = Cop_in / data_gpu                
+                cp.fft.config.clear_plan_cache()
+                
+                modeled_gpu = Cop_out * reflectivity_gpu
+                cp.fft.config.clear_plan_cache()
+
+                modeled = cp.asnumpy(modeled_gpu)
+
+                print("✅ 2D designature using GPU.")
+                return modeled.reshape([n_samples,n_traces])
+            else:
+                Cop_in = pylops.signalprocessing.Convolve1D(dims=[n_samples,n_traces], h=wavelet_in_cut, offset=offset_in, axis=0, dtype='float32')
+                Cop_out = pylops.signalprocessing.Convolve1D(dims=[n_samples,n_traces], h=wavelet_out_cut, offset=offset_out, axis=0, dtype='float32')
+
+                reflectivity = Cop_in / data.flatten()
+                modeled = Cop_out @ reflectivity
+
+                print("✅ 2D designature using CPU.")
+                return modeled.reshape([n_samples,n_traces])
 
         else:
             print(f"❌ Unsupported data dimension: {data.ndim}")
