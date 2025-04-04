@@ -1,9 +1,31 @@
 #include <cmath>
 #include <vector>
 #include <fstream>
+#include <fcntl.h>
+#include <nppi.h>
+#include <assert.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <iostream>
 #include <cuda_runtime.h>
-#include "cnpy.h"
+#include <cerrno>
+#include <cstring>
+#include <memory>
+#include <stdexcept>
+#include <npp.h>
+// #include <nppi.h>
+// #include <nppi_resize.h>  // Specifically required for nppiResize_32f_C1R with scaling
+
+// Error check macro
+#define CHECK_CUDA(err) \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error: %s\n", cudaGetErrorString(err)); \
+        exit(EXIT_FAILURE); \
+    }
 
 __global__ void fsm_kernel(float* T, float* S, int* sgnv, int* sgnt, int sgni, int sgnj,
                            int x_offset, int z_offset, int xd, int zd,
@@ -205,29 +227,17 @@ void free_eikonal(float* ptr) {
 }
 }
 
-
-extern "C" {
-    void reset_device() {
-        cudaError_t err = cudaDeviceReset();
-        // Optionally, you can check for errors:
-        if (err != cudaSuccess) {
-            // Handle error as needed
-        }
-    }
-}
-
-
 extern "C" {
 
     // Kernel that performs on-the-fly migration for one output pixel (as shown previously)
-    __global__ void _migrate_constant_velocity(const float* data,
-                                                const float* cdp,
-                                                const float* offsets,
+    __global__ void _migrate_constant_velocity(const float* __restrict__ data,
+                                                const float* __restrict__ cdp,
+                                                const float* __restrict__ offsets,
                                                 float v,
                                                 float dt, float dx, float dz,
                                                 int nsmp, int ntraces,
                                                 int nx, int nz,
-                                                float* R)
+                                                float* __restrict__ R)
     {
         // Each thread computes one output pixel (ix, iz)
         int ix = blockIdx.x * blockDim.x + threadIdx.x;
@@ -239,6 +249,7 @@ extern "C" {
         float sum = 0.0f;
         
         // Loop over traces
+        #pragma unroll 9
         for (int j = 0; j < ntraces-1; j++) {
             float cdp_val = cdp[j];    // effective CDP for trace j
             float h = offsets[j] * 0.5f; // half offset for trace j
@@ -251,7 +262,7 @@ extern "C" {
             float dxg = x - receiver;
             float rs = sqrtf(dxs*dxs + z*z);
             float rr = sqrtf(dxg*dxg + z*z);
-            float eps = 1e-7f;
+            float eps = 1e-10f;
             if (rs < eps) rs = eps;
             if (rr < eps) rr = eps;
             
@@ -272,8 +283,9 @@ extern "C" {
             sum += amp * weight;
         }
         // Write the accumulated sum to the output migrated image R (assume row-major, shape (nx, nz))
-        R[ix * nz + iz] = sum;
+        R[ix + iz * nx] = sum;
     }
+
     
     // Host-callable wrapper function for migration
     // This function allocates memory, sets up kernel launch parameters, and calls the kernel.
@@ -283,8 +295,9 @@ extern "C" {
                                    float* R)
     {
         // Define block and grid dimensions.
-        dim3 block(16, 16);
+        dim3 block(32, 8);
         dim3 grid((nx + block.x - 1) / block.x, (nz + block.y - 1) / block.y);
+        // dim3 grid((ntraces + block.x - 1) / block.x, (nx + block.y - 1) / block.y);
         
         // Launch the kernel.
         _migrate_constant_velocity<<<grid, block>>>(data, cdp, offsets, v, dt, dx, dz,
@@ -295,17 +308,129 @@ extern "C" {
 }
 
 
+
+
+//----------------------------------------------------------------------------
+// Helper structure and functions for mapping a file into pinned memory.
+// A simple structure to hold mapped file info.
+
+extern "C" void init_cuda_with_mapped_host() {
+    cudaError_t err = cudaSetDeviceFlags(cudaDeviceMapHost);
+    if (err != cudaSuccess) {
+        std::cerr << "cudaSetDeviceFlags failed: " << cudaGetErrorString(err) << std::endl;
+    }
+}
+
+// Function: Load binary file into heap-allocated buffer
+float* load_binary_file(const char* filename, size_t* out_count)
+{
+    FILE* file = fopen(filename, "rb");
+    if (!file) {
+        perror("Failed to open file");
+        return NULL;
+    }
+
+    // Get size in bytes and compute number of float elements
+    fseek(file, 0, SEEK_END);
+    size_t filesize = ftell(file);
+    rewind(file);
+
+    if (filesize % sizeof(float) != 0) {
+        fprintf(stderr, "File size is not a multiple of float size\n");
+        fclose(file);
+        return NULL;
+    }
+
+    *out_count = filesize / sizeof(float);
+
+    float* data = (float*)malloc(filesize);
+    if (!data) {
+        perror("malloc failed");
+        fclose(file);
+        return NULL;
+    }
+
+    size_t read_count = fread(data, sizeof(float), *out_count, file);
+    fclose(file);
+
+    if (read_count != *out_count) {
+        fprintf(stderr, "fread failed: expected %zu floats, got %zu\n", *out_count, read_count);
+        free(data);
+        return NULL;
+    }
+
+    return data;
+}
+
+// Function: Copy data from host to device
+float* copy_to_device(const float* host_data, size_t count)
+{
+    float* device_data = NULL;
+    CHECK_CUDA(cudaMalloc((void**)&device_data, count * sizeof(float)));
+    CHECK_CUDA(cudaMemcpy(device_data, host_data, count * sizeof(float), cudaMemcpyHostToDevice));
+    return device_data;
+}
+
+
+void resample_field_into_npp_cubic(float* d_base,
+                                   float* d_dst,
+                                   size_t offset_index,
+                                   int nx_coarse, int nz_coarse,
+                                   int nx_fine, int nz_fine)
+{
+    // Compute pointer to the selected field
+    size_t field_size = nx_coarse * nz_coarse;
+    float* d_src = d_base + offset_index * field_size;
+
+    // Set up NPP image sizes
+    NppiSize src_size = { nx_coarse, nz_coarse };
+    NppiSize dst_size = { nx_fine, nz_fine };
+
+    // Define source and destination ROIs
+    NppiRect src_roi = { 0, 0, nx_coarse, nz_coarse };
+    NppiRect dst_roi = { 0, 0, nx_fine, nz_fine };
+
+    int src_step = nx_coarse * sizeof(float);
+    int dst_step = nx_fine * sizeof(float);
+
+    // Perform the resize operation
+    NppStatus status = nppiResize_32f_C1R(
+        d_src, src_step, src_size, src_roi,
+        d_dst, dst_step, dst_size, dst_roi,
+        NPPI_INTER_CUBIC
+    );
+
+    if (status != NPP_SUCCESS) {
+        fprintf(stderr, "nppiResize_32f_C1R failed with code: %d\n", status);
+    }
+}
+//----------------------------------------------------------------------------
+
+//----------------------------------------------------------------------------
+// Host-callable migration function.
+// This version re-reads (via pointer arithmetic) a traveltime field from a memory-mapped file
+// for each update, resamples it to fine dimensions using NPP, and calls the migration kernel.
+// Parameters:
+//  - cdp, offsets, v, dt, dx, dz, nsmp, ntraces: parameters for migration.
+//  - nx_coarse, nz_coarse: dimensions of each coarse traveltime field in the file.
+//  - nx_fine, nz_fine: desired fine output dimensions.
+//  - R: output migrated image (device pointer).
+//  - traveltime_filename: path to the binary file with appended traveltime fields.
+//  - num_fields: number of traveltime fields in the file.
+
 extern "C" {
 
     // Kernel that performs on-the-fly migration for one output pixel (as shown previously)
-    __global__ void _migrate_variable_velocity(const float* data,
-                                                const float* cdp,
-                                                const float* offsets,
+    __global__ void _migrate_variable_velocity(const float* __restrict__ data,
+                                                const float* __restrict__ cdp,
+                                                const float* __restrict__ offsets,
+                                                const float* __restrict__ SourceTraveltime,
+                                                const float* __restrict__ ReceiverTraveltime,
                                                 float v,
                                                 float dt, float dx, float dz,
-                                                int nsmp, int ntraces,
+                                                int nsmp, int ntraces, int init_traces,
                                                 int nx, int nz,
-                                                float* R)
+                                                float* __restrict__ R)
     {
         // Each thread computes one output pixel (ix, iz)
         int ix = blockIdx.x * blockDim.x + threadIdx.x;
@@ -317,7 +442,9 @@ extern "C" {
         float sum = 0.0f;
         
         // Loop over traces
-        for (int j = 0; j < ntraces-1; j++) {
+        #pragma unroll 9
+        for (int j = init_traces; j < init_traces+ntraces; j++) {
+            
             float cdp_val = cdp[j];    // effective CDP for trace j
             float h = offsets[j] * 0.5f; // half offset for trace j
             // float doffset = fabsf(offsets[j+1]-offsets[j]);
@@ -329,12 +456,16 @@ extern "C" {
             float dxg = x - receiver;
             float rs = sqrtf(dxs*dxs + z*z);
             float rr = sqrtf(dxg*dxg + z*z);
-            float eps = 1e-7f;
+            float eps = 1e-10f;
             if (rs < eps) rs = eps;
             if (rr < eps) rr = eps;
+
+            float s_traveltime = 1.0f / SourceTraveltime[ix + iz * nx];
+            float r_traveltime = 1.0f / ReceiverTraveltime[ix + iz * nx];
+
             
             // Compute two-way travel time:
-            float t_val = (rs + rr) / v;
+            float t_val = s_traveltime + r_traveltime;
             int it = (int) floorf(t_val / dt);
             if (it < 0 || it >= nsmp) continue;
             
@@ -346,28 +477,106 @@ extern "C" {
             float sqrt_rr_rs = 1.0f/sqrt_rs_rr;
             float weight = ((z/rs)*sqrt_rs_rr + (z/rr)*sqrt_rr_rs) / v;
             weight *= 0.3989422804f;  // 1/sqrt(2*pi)
-            
+
             sum += amp * weight;
         }
         // Write the accumulated sum to the output migrated image R (assume row-major, shape (nx, nz))
-        R[ix * nz + iz] = sum;
+        R[ix + iz * nx] = sum;
     }
-    
-    // Host-callable wrapper function for migration
-    // This function allocates memory, sets up kernel launch parameters, and calls the kernel.
-    void migrate_variable_velocity(const float* data, const float* cdp, const float* offsets,
-                                   float v, float dt, float dx, float dz,
-                                   int nsmp, int ntraces, int nx, int nz,
-                                   float* R)
-    {
-        // Define block and grid dimensions.
-        dim3 block(16, 16);
-        dim3 grid((nx + block.x - 1) / block.x, (nz + block.y - 1) / block.y);
-        
-        // Launch the kernel.
-        _migrate_constant_velocity<<<grid, block>>>(data, cdp, offsets, v, dt, dx, dz,
-                                                     nsmp, ntraces, nx, nz, R);
-        cudaDeviceSynchronize();
+}
+
+
+extern "C" void migrate_variable_velocity(const float* data, const float* cdp, const float* offsets, 
+                                            const float* eikonal_positions, const int* segments,
+                                            float v, float dt, float dx, float dz,
+                                            int nsmp, int ntraces,
+                                            int nx_coarse, int nz_coarse,
+                                            int nx_fine, int nz_fine,
+                                            float* R,
+                                            const char* traveltime_filename,
+                                            const char* gradient_filename,
+                                            int num_segments)
+{
+
+
+    // Assume each coarse traveltime field has the same size:
+
+    size_t num_floats = 226*nx_coarse * nz_coarse * sizeof(float);
+
+    // allocated fine traveltime
+    float* d_SourceTravelTime_fine = NULL;
+    float* d_ReceiverTravelTime_fine = NULL;
+
+    // size_t fine_size_bytes = nx_fine * nz_fine * sizeof(float);
+    // cudaMalloc((void**)&d_SourceTravelTime_fine, num_floats);
+    // cudaMalloc((void**)&d_ReceiverTravelTime_fine, num_floats);
+
+    float* h_SourceTravelTimeCoarse = load_binary_file(traveltime_filename, &num_floats);
+    if (!h_SourceTravelTimeCoarse) {
+        fprintf(stderr, "Failed to load file.\n");
+        // return 1;
     }
 
+    float* d_ReceiverTravelTime_fine = load_binary_file(traveltime_filename, &num_floats);
+
+    if (!h_TravelTimeCoarse) {
+        fprintf(stderr, "Failed to load file.\n");
+        // return 1;
+    }
+
+
+    float* d_TravelTimeCoarse = copy_to_device(h_TravelTimeCoarse, num_floats);
+
+    int old_src_index = -1;
+    int old_rec_index = -1;
+    size_t init_traces = 0;
+    for (int field = 0; field < num_segments; field++) {
+        
+        int n_traces = segments[field];
+
+        float sx = cdp[init_traces] - 0.5f * offsets[init_traces];
+        float rx = cdp[init_traces] + 0.5f * offsets[init_traces];
+
+        int src_index = static_cast<int>(sx/300.0f);
+        int rec_index = static_cast<int>(rx/300.0f);
+
+        float x_x0_src = eikonal_positions[src_index] - sx;
+        float x_x0_rec = eikonal_positions[rec_index] - rx;
+
+        // if (old_src_index != src_index)
+        // {
+        //     resample_field_into_npp_cubic(d_TravelTimeCoarse, d_SourceTravelTime_fine,  src_index, 
+        //         nx_coarse, nz_coarse, nx_fine, nz_fine);
+            
+        //     old_src_index = src_index;
+        // }
+            
+        // if (old_rec_index != rec_index)
+        // {
+        //     resample_field_into_npp_cubic(d_TravelTimeCoarse, d_ReceiverTravelTime_fine,  rec_index, 
+        //         nx_coarse, nz_coarse, nx_fine, nz_fine);
+            
+        //     old_rec_index = rec_index;
+        // }
+            
+        dim3 block(16, 16);
+        dim3 grid((nx_fine + block.x - 1) / block.x, (nz_fine + block.y - 1) / block.y);
+        // dim3 grid((ntraces + block.x - 1) / block.x, (nx + block.y - 1) / block.y);
+        
+        // Launch the kernel.
+        _migrate_variable_velocity<<<grid, block>>>(data, cdp, offsets, d_SourceTravelTime_fine, 
+                                                    d_ReceiverTravelTime_fine, v, dt, dx, dz,
+                                                     nsmp, ntraces, init_traces, nx_fine, nz_fine, R);
+        cudaDeviceSynchronize();
+        init_traces += n_traces;
+        
+    }
+
+    cudaFree(d_SourceTravelTime_fine);
+    cudaFree(d_ReceiverTravelTime_fine);
+    cudaFree(d_TravelTimeCoarse);
+    free(h_TravelTimeCoarse);
 }
+
+
+

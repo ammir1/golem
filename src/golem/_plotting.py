@@ -3,7 +3,7 @@ from matplotlib import gridspec
 import numpy as np
 import pandas as pd
 
-def plot_seismic_image(context, xlabel, ylabel, y_spacing, x_header, perc, key="data", xlim=None, ylim=None):
+def plot_seismic_image(context, xlabel, ylabel, y_spacing, x_header, perc, key="data", xlim=None, ylim=None, figure_dims=(7,9)):
     data = context.get(key)
     df = context.get("geometry")
 
@@ -40,7 +40,7 @@ def plot_seismic_image(context, xlabel, ylabel, y_spacing, x_header, perc, key="
             clip_value = np.percentile(data, perc)
             extent = [x_values[0], x_values[-1], y_values[-1], y_values[0]]
 
-            plt.figure(figsize=(12, 6), dpi=150)
+            plt.figure(figsize=figure_dims)
             plt.imshow(data, aspect='auto', cmap='gray_r', vmin=-clip_value, vmax=clip_value, extent=extent)
             plt.xlabel(xlabel)
             plt.ylabel(ylabel)
@@ -59,7 +59,7 @@ def plot_seismic_image(context, xlabel, ylabel, y_spacing, x_header, perc, key="
             y = np.arange(len(data)) * y_spacing
 
             # Use a more compact vertical layout
-            plt.figure(figsize=(4, 6), dpi=100)
+            plt.figure(figsize=figure_dims)
             plt.plot(data, y, color='black', linewidth=1)
             plt.gca().invert_yaxis()  # Time increases downward
             plt.xlabel("Amplitude")

@@ -7,6 +7,8 @@ import ctypes
 import pandas as pd
 import cupy as cp
 import nvidia.dali as dali
+from numba.typed import Dict
+from numba.types import Tuple, int64
 
 # Resolve absolute path
 lib_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "lib", "libEikonal.so"))
@@ -45,18 +47,72 @@ fsm_lib.migrate_constant_velocity.argtypes = [
 fsm_lib.migrate_constant_velocity.restype = None
 
 # --------------------------
+# Declare migrate_variable_velocity
+# --------------------------
+fsm_lib.init_cuda_with_mapped_host()
+
+# Define the argument types for the function.
+fsm_lib.migrate_variable_velocity.argtypes = [
+    np.ctypeslib.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS"),  # const float* data
+    np.ctypeslib.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS"),  # const float* cdp
+    np.ctypeslib.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS"),  # const float* offsets
+    np.ctypeslib.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS"),  # const float* eikonal positions
+    np.ctypeslib.ndpointer(dtype=np.int32, flags="C_CONTIGUOUS"),    # const int* segments
+    ctypes.c_float,    # float v
+    ctypes.c_float,    # float dt
+    ctypes.c_float,    # float dx
+    ctypes.c_float,    # float dz
+    ctypes.c_int,      # int nsmp
+    ctypes.c_int,      # int ntraces
+    ctypes.c_int,      # int nx_coarse
+    ctypes.c_int,      # int nz_coarse
+    ctypes.c_int,      # int nx_fine
+    ctypes.c_int,      # int nz_fine
+    np.ctypeslib.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS"),  # float* R
+    ctypes.c_char_p,   # const char* traveltime_filename
+    ctypes.c_char_p,   # const char* gradient_filename
+    ctypes.c_int       # int num_segments
+]
+
+# The function returns void.
+fsm_lib.migrate_variable_velocity.restype = None
+
+# --------------------------
 # Declare free_eikonal function
 # --------------------------
 fsm_lib.free_eikonal.argtypes = [ctypes.POINTER(ctypes.c_float)]
 fsm_lib.free_eikonal.restype = None
 
 
-# Declare the reset_device function
-fsm_lib.reset_device.argtypes = []   # no arguments
-fsm_lib.reset_device.restype = None  # no return value
-
-# Call the function
-fsm_lib.reset_device()
+@nb.njit
+def compute_trace_segments(src, rec):
+    n = src.shape[0]
+    if n == 0:
+        return np.empty(0, dtype=np.int64)
+    
+    # Allocate an output array with maximum possible size (n)
+    segs = np.empty(n, dtype=np.int64)
+    seg_count = 0
+    count = 1
+    prev_src = src[0]
+    prev_rec = rec[0]
+    
+    for i in range(1, n):
+        # Check if both source and receiver are identical to previous.
+        if src[i] == prev_src and rec[i] == prev_rec:
+            count += 1
+        else:
+            segs[seg_count] = count
+            seg_count += 1
+            count = 1
+            prev_src = src[i]
+            prev_rec = rec[i]
+    
+    segs[seg_count] = count
+    seg_count += 1
+    
+    # Return the array up to the number of segments found.
+    return segs[:seg_count]
 
 
 def compute_traveltime_field(Vp, sx, sz, dx, dz, nx, nz):
@@ -254,7 +310,7 @@ def migrate_constant_velocity_numba(data, cdp_x, offsets, v, dx, dz, dt, nx, nz,
 
 
 
-def compute_and_store_traveltime_fields(Vp, shot_positions, depth_positions, dx, dz, nx, nz, output_folder):
+def compute_and_store_traveltime_fields(Vp, shot_positions, depth_positions, dx, dz, nx, nz, output_folder,output_filename,output_filename2):
     """
     Compute the traveltime field for each shot (or CDP) on a coarse grid,
     and store the results in a single NPY file.
@@ -273,26 +329,34 @@ def compute_and_store_traveltime_fields(Vp, shot_positions, depth_positions, dx,
     """
     nshots = shot_positions.shape[0]
     # Allocate array for traveltime.
-    T_all = np.zeros((nshots, 2, nz, nx), dtype=np.float32)
+    # T_all = np.zeros((nshots, 2, nz, nx), dtype=np.float32)
     
+    filepath = os.path.join(output_folder, output_filename)
+    filepath2 = os.path.join(output_folder, output_filename2)
+    # Open the file in binary write mode once.
+    file_traveltime = open(filepath, 'wb')
+    file_gradient = open(filepath2, 'wb')
     for i in range(nshots):
         sx = shot_positions[i]
         sz = depth_positions[i]
-        T, dT_dx = compute_traveltime_with_derivative(Vp, sx, sz, dx, dz, nx, nz)
-        T_all[i, 0, :, :] = T
-        T_all[i, 1, :, :] = dT_dx
-
-        output_filename = f"traveltime_{i:03}.npy"
-        np.save(output_folder + output_filename, T_all[i])  # shape: (2, nz, nx)
+        # Compute traveltime field for this shot.
+        # Traveltime = 1.0/compute_traveltime_field(Vp, sx, sz, dx, dz, nx, nz)
+        traveltime, gradient = compute_traveltime_with_derivative(Vp, sx, sz, dx, dz, nx, nz)
+        # Convert to a contiguous array of type float32.
+        data = np.ascontiguousarray(traveltime.astype(np.float32))
+        data2 = np.ascontiguousarray(gradient.astype(np.float32))
+        # Write raw bytes of the array to the file.
+        file_traveltime.write(data.tobytes())
+        file_gradient.write(data2.tobytes())
 
     # Ensure output folder exists.
     # os.makedirs(output_folder, exist_ok=True)
-    filepath = os.path.join(output_folder, output_filename)
+    
     
     # Save the traveltime fields as a single NPY file.
     # np.save(filepath, T_all)
     
-    return filepath
+    return filepath, filepath2
 
 
 def migrate_constant_velocity_cuda(data, cdp_x, offsets, v, dx, dz, dt, nx, nz):
@@ -331,6 +395,13 @@ def migrate_constant_velocity_cuda(data, cdp_x, offsets, v, dx, dz, dt, nx, nz):
     offsets_contig = np.ascontiguousarray(offsets.astype(np.float32))
     R = np.ascontiguousarray(np.zeros((nx*nz), dtype=np.float32))
 
+    # Create CUDA events.
+    start_event = cp.cuda.Event()
+    end_event = cp.cuda.Event()
+
+    # Record the start event.
+    start_event.record()
+
     fsm_lib.migrate_constant_velocity(data_contig, cdp_x_contig, offsets_contig,
                                         np.float32(v), np.float32(dt),
                                         np.float32(dx), np.float32(dz),
@@ -339,63 +410,39 @@ def migrate_constant_velocity_cuda(data, cdp_x, offsets, v, dx, dz, dt, nx, nz):
                                         ctypes.c_int(nx),
                                         ctypes.c_int(nz),
                                         R)
-    
+
+    # Record the end event.
+    end_event.record()
+
+    # Wait for the events to be completed.
+    end_event.synchronize()
+
+    # Get the elapsed time in milliseconds.
+    elapsed_time_ms = cp.cuda.get_elapsed_time(start_event, end_event)
+    print("Kernel execution time (ms):", elapsed_time_ms*0.001)
+
     # Reshape R to (nx, nz) if needed.
-    migrated_image = -R.reshape((nx, nz),order='C').T
+    migrated_image = -R.reshape((nz, nx))
 
     return migrated_image
 
-class TraveltimePipeline(dali.pipeline.Pipeline):
-    def __init__(self, folder, num_threads=2, device_id=0):
-        super().__init__(batch_size=1, num_threads=num_threads, device_id=device_id, seed=42)
-        self.input = dali.fn.readers.numpy(device="gpu", file_root=folder, random_shuffle=False)
+from nvidia.dali import pipeline_def, fn
 
-    def define_graph(self):
-        data = self.input()  # shape: (2, nz, nx)
+@pipeline_def(batch_size=1, num_threads=1, device_id=0)
+def pipe_traveltime(file_root, files, Nx, Nz):
+    traveltime = fn.readers.numpy(device="gpu", file_root=file_root, files=files)
 
-        traveltime = dali.fn.slice(data, start=[0, 0, 0], shape=[1, -1, -1], axes=[0, 1, 2])
-        derivative = dali.fn.slice(data, start=[1, 0, 0], shape=[1, -1, -1], axes=[0, 1, 2])
+    traveltime_resized = dali.fn.resize(
+        traveltime,
+        size=[Nz, Nx],
+        interp_type= dali.types.DALIInterpType.INTERP_LANCZOS3
+    )
 
-        traveltime = dali.fn.squeeze(traveltime, axes=[0])
-        derivative = dali.fn.squeeze(derivative, axes=[0])
+    return traveltime_resized
 
-        traveltime_resized = dali.fn.resize(
-            traveltime,
-            interp_type=dali.fn.interp_type.LANCZOS3,
-            size=[self.nx, self.nz]
-        )
 
-        derivative_resized = dali.fn.resize(
-            derivative,
-            interp_type=dali.fn.interp_type.LANCZOS3,
-            size=[self.nx, self.nz]
-        )
-
-        return traveltime_resized, derivative_resized
-
-class MyNpyPipeline(dali.pipeline.Pipeline):
-    def __init__(self, npy_path, batch_size, num_threads, device_id, nx, nz):
-        super().__init__(batch_size, num_threads, device_id, seed=42)
-        self.folder = os.path.dirname(npy_path)
-        self.filename = os.path.basename(npy_path)
-        self.nx = nx
-        self.nz = nz
-
-    def define_graph(self):
-        data = dali.fn.readers.numpy(
-            device="gpu",
-            file_root=self.folder,
-            files=[self.filename]
-        )
-
-        resized = dali.fn.resize(
-            data,
-            interp_type=dali.fn.interp_type.LANCZOS3,
-            size=[self.nx, self.nz]
-        )
-        return resized
-
-def migrate_variable_velocity_cuda(data, cdp_x, offsets, v, dx, dz, dt, nx, nz, npy_path):
+def migrate_variable_velocity_cuda(data, Geometry_Dataframe, segments, eikonal_positions, v, dx, dz, dt, nx_coarse, nz_coarse, 
+                                   nx_fine, nz_fine, traveltime_path, gradient_path, key_cdp = "CDP_X",key_offset='offset'):
     """
     Fully vectorized GPU Kirchhoff migration using CuPy with trace‐batching to limit memory usage.
     
@@ -421,34 +468,48 @@ def migrate_variable_velocity_cuda(data, cdp_x, offsets, v, dx, dz, dt, nx, nz, 
                 Migrated image on CPU (shape: (nx, nz)).
     """
     
-    pipe = TraveltimePipeline(folder=npy_path)
-    pipe.build()
+    # pipe = pipe_traveltime(npy_folder,npy_filenames, nx, nz)
+    # pipe.build()
     
     nsmp, ntraces = data.shape
 
-    
+    cdp_x = Geometry_Dataframe[key_cdp].to_numpy()
+    offsets = Geometry_Dataframe[key_offset].to_numpy()
 
-    # R = np.zeros((nx * nz), dtype=np.float32)  # flattened array
+    # Ensure arrays are contiguous:
+    data_contig = np.ascontiguousarray(data.T.astype(np.float32))
+    cdp_x_contig = np.ascontiguousarray(cdp_x.astype(np.float32))
+    offsets_contig = np.ascontiguousarray(offsets.astype(np.float32))
+    eikonal_positions_contig = np.ascontiguousarray(eikonal_positions.astype(np.float32))
+    num_segments = len(segments)
+    segments = np.ascontiguousarray(segments.astype(np.int32))
+    R = np.ascontiguousarray(np.zeros((nx_fine*nz_fine), dtype=np.float32))
 
-    # # Ensure arrays are contiguous:
-    # data_contig = np.ascontiguousarray(data.T.astype(np.float32))
-    # cdp_x_contig = np.ascontiguousarray(cdp_x.astype(np.float32))
-    # offsets_contig = np.ascontiguousarray(offsets.astype(np.float32))
-    # R = np.ascontiguousarray(np.zeros((nx*nz), dtype=np.float32))
+    # Convert to bytes for ctypes (c_char_p expects bytes)
+    clean_path = traveltime_path.strip()
+    # Convert to bytes for ctypes (c_char_p expects a null-terminated byte string)
+    traveltime_path_bytes = clean_path.encode('utf-8')
 
-    # fsm_lib.migrate_constant_velocity(data_contig, cdp_x_contig, offsets_contig,
-    #                                     np.float32(v), np.float32(dt),
-    #                                     np.float32(dx), np.float32(dz),
-    #                                     ctypes.c_int(nsmp),
-    #                                     ctypes.c_int(ntraces),
-    #                                     ctypes.c_int(nx),
-    #                                     ctypes.c_int(nz),
-    #                                     R, npy_path)
+    # Convert to bytes for ctypes (c_char_p expects bytes)
+    clean_path = gradient_path.strip()
+    # Convert to bytes for ctypes (c_char_p expects a null-terminated byte string)
+    gradient_path_bytes = clean_path.encode('utf-8')
+
+    # fsm_lib.init_cuda_with_mapped_host()
+
+    fsm_lib.migrate_variable_velocity(data_contig, cdp_x_contig, offsets_contig, eikonal_positions_contig, segments,
+                                        np.float32(v), np.float32(dt),
+                                        np.float32(dx), np.float32(dz),
+                                        ctypes.c_int(nsmp),
+                                        ctypes.c_int(ntraces),
+                                        ctypes.c_int(nx_coarse), ctypes.c_int(nz_coarse), 
+                                        ctypes.c_int(nx_fine), ctypes.c_int(nz_fine),
+                                        R, traveltime_path_bytes, gradient_path_bytes, num_segments)
     
     # # Reshape R to (nx, nz) if needed.
-    # migrated_image = -R.reshape((nx, nz),order='C').T
+    migrated_image = -R.reshape((nz_fine, nx_fine))
 
-    # return migrated_image
+    return migrated_image
 
 
 @nb.njit(parallel=True, fastmath=True)
