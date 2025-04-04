@@ -7,10 +7,183 @@ import re
 import pylops
 import cupy as cp
 
+def kill_traces_outside_box(context, key_geometry='geometry', key_data='data', columns=['SourceX','SourceY','GroupX','GroupY']):
+    """
+    Eliminates rows in the geometry DataFrame and corresponding columns in the seismogram array 
+    where any of the specified columns have negative values.
+    
+    Parameters:
+        context (dict): Dictionary containing 'geometry' (a DataFrame) and 'data' (a 2D NumPy array).
+        key_geometry (str): Key in context for the geometry DataFrame.
+        key_data (str): Key in context for the seismogram array.
+        columns (list): List of column names to check for nonnegative values.
+    
+    Returns:
+        None. The function updates the context in-place.
+    """
+    import numpy as np
+    
+    geometry_df = context.get(key_geometry)
+    data = context.get(key_data)
+    
+    if geometry_df is None or data is None:
+        print("❌ Error: Missing geometry DataFrame or data array in context.")
+        return
+    
+    # Create a boolean mask for rows (traces) where all specified columns are >= 0
+    mask = np.ones(len(geometry_df), dtype=bool)
+    for col in columns:
+        if col not in geometry_df.columns:
+            print(f"❌ Warning: Column '{col}' not found in geometry DataFrame. Skipping this column.")
+            continue
+        mask &= (geometry_df[col] >= 0)
+    
+    # Filter the geometry DataFrame using the mask and reset the index
+    filtered_geometry_df = geometry_df[mask].reset_index(drop=True)
+    
+    # Filter the seismogram array along the second axis (columns)
+    # Assuming data shape is (num_samples, num_traces)
+    try:
+        filtered_seismogram = data[:, mask]
+    except Exception as e:
+        print(f"❌ Error filtering seismogram array: {e}")
+        return
+    
+    # Update the context with the filtered results
+    context[key_geometry] = filtered_geometry_df
+    context[key_data] = filtered_seismogram
 
+def calculate_azimuth(corner_x,corner_y):
+    
+    x1=corner_x[0]
+    x2=corner_x[2]
+    y1=corner_y[0]
+    y2=corner_y[2]
 
-def create_header(context, header_name, expression):
-    df = context.get("geometry")
+    return np.arctan2(y2 - y1, x2 - x1) 
+
+def get_local_coordinates(x,y,x0,y0,theta):
+    
+    x=x-x0
+    y=y-y0
+    
+    x_local = x * np.cos(theta) + y * np.sin(theta)
+    y_local =-x * np.sin(theta) + y * np.cos(theta)
+    
+    
+    return x_local,y_local
+
+def generate_local_coordinates(context, key_model_geometry='model geometry', key_geometry='geometry', isVelocityModel=False):
+    """
+    Converts acquisition geometry coordinates to local coordinates using the model geometry as reference.
+    The reference is determined using the 'SourceX' and 'SourceY' columns in the model DataFrame.
+    For velocity models, only source coordinates are converted; for other cases, both source and group
+    coordinates are processed.
+
+    Parameters:
+        context (dict): Dictionary containing the geometry DataFrames.
+        key_model_geometry (str): Key for the model geometry DataFrame in context (default 'model geometry').
+        key_geometry (str): Key for the acquisition geometry DataFrame in context (default 'geometry').
+        isVelocityModel (bool): If True, only source coordinates are processed (default False).
+
+    Returns:
+        pd.DataFrame: The updated acquisition geometry DataFrame with local coordinates,
+                      or None if an error occurs.
+    """
+    # Validate context
+    if context is None or not isinstance(context, dict):
+        print("❌ Error: Invalid context provided.")
+        return None
+
+    # Retrieve DataFrames
+    model_df = context.get(key_model_geometry)
+    geom_df = context.get(key_geometry)
+
+    if model_df is None or not isinstance(model_df, pd.DataFrame):
+        print(f"❌ Error: Model geometry DataFrame not found or invalid under key '{key_model_geometry}'.")
+        return None
+
+    if geom_df is None or not isinstance(geom_df, pd.DataFrame):
+        print(f"❌ Error: Acquisition geometry DataFrame not found or invalid under key '{key_geometry}'.")
+        return None
+
+    # Verify required columns in model geometry
+    for col in ['SourceX', 'SourceY']:
+        if col not in model_df.columns:
+            print(f"❌ Error: Column '{col}' not found in model geometry DataFrame.")
+            return None
+
+    # Verify required columns in acquisition geometry
+    required_geom = ['SourceX', 'SourceY']
+    if not isVelocityModel:
+        required_geom += ['GroupX', 'GroupY']
+    for col in required_geom:
+        if col not in geom_df.columns:
+            print(f"❌ Error: Column '{col}' not found in acquisition geometry DataFrame.")
+            return None
+
+    try:
+        # Compute corner coordinates from the model geometry
+        corner_x = [np.min(model_df['SourceX']), np.max(model_df['SourceX']),
+                    np.min(model_df['SourceX']), np.max(model_df['SourceX'])]
+        corner_y = [np.min(model_df['SourceY']), np.min(model_df['SourceY']),
+                    np.max(model_df['SourceY']), np.max(model_df['SourceY'])]
+    except Exception as e:
+        print(f"❌ Error computing model corner coordinates: {e}")
+        return None
+
+    try:
+        # Calculate the azimuth angle using the model corners
+        angle = calculate_azimuth(corner_x, corner_y)
+    except Exception as e:
+        print(f"❌ Error calculating azimuth: {e}")
+        return None
+
+    try:
+        # Extract source coordinates from acquisition geometry
+        sx = geom_df['SourceX'].to_numpy()
+        sy = geom_df['SourceY'].to_numpy()
+    except Exception as e:
+        print(f"❌ Error extracting source coordinates: {e}")
+        return None
+
+    gx = gy = None
+    if not isVelocityModel:
+        try:
+            gx = geom_df['GroupX'].to_numpy()
+            gy = geom_df['GroupY'].to_numpy()
+        except Exception as e:
+            print(f"❌ Error extracting group coordinates: {e}")
+            return None
+
+    try:
+        # Convert source coordinates to local coordinates
+        sx_local, sy_local = get_local_coordinates(sx, sy, corner_x[0], corner_y[0], angle)
+    except Exception as e:
+        print(f"❌ Error converting source coordinates to local coordinates: {e}")
+        return None
+
+    if not isVelocityModel:
+        try:
+            # Convert group coordinates to local coordinates
+            gx_local, gy_local = get_local_coordinates(gx, gy, corner_x[0], corner_y[0], angle)
+        except Exception as e:
+            print(f"❌ Error converting group coordinates to local coordinates: {e}")
+            return None
+
+    # Update the acquisition geometry DataFrame with local coordinates
+    geom_df['SourceX'] = sx_local
+    geom_df['SourceY'] = sy_local
+    if not isVelocityModel:
+        geom_df['GroupX'] = gx_local
+        geom_df['GroupY'] = gy_local
+
+    # Update context and return the updated geometry
+    context[key_geometry] = geom_df
+    return geom_df
+
+def create_header(context, header_name, expression, key="geometry"):
+    df = context.get(key)
 
     if df is None:
         print("❌ Error: 'geometry' not found in context.")
@@ -38,9 +211,9 @@ def create_header(context, header_name, expression):
     except Exception as e:
         print(f"❌ Failed to create header '{header_name}': {e}")
         return None
-def subset_geometry_by_condition(context, condition, key="data"):
-    df = context.get("geometry")
-    data = context.get(key)
+def subset_geometry_by_condition(context, condition, key_input="data", key_output="data", key_geometry_input="geometry", key_geometry_output="geometry"):
+    df = context.get(key_geometry_input)
+    data = context.get(key_input)
 
     if df is None or not isinstance(df, pd.DataFrame):
         print("❌ Error: 'geometry' not found or invalid.")
@@ -61,8 +234,8 @@ def subset_geometry_by_condition(context, condition, key="data"):
         filtered_data = data[:, filtered_df.index.to_numpy()]
 
         # Update both geometry and data in context
-        context["geometry"] = filtered_df.reset_index(drop=True)
-        context[key] = filtered_data
+        context[key_geometry_output] = filtered_df.reset_index(drop=True)
+        context[key_output] = filtered_data
 
         return filtered_df
     except Exception as e:
@@ -390,3 +563,24 @@ def sort(context, header1, header2=None, key="data"):
         print(f"❌ Failed to sort geometry: {e}")
         return None
     
+def scale_coordinate_units(context, key="geometry", XY_headers=['SourceX', 'SourceY', 'GroupX', 'GroupY'], elevation_headers=['SourceDepth', 'ReceiverDatumElevation'], 
+                           XY_Scaler = 100., elevation_scaler = 100.):
+    df = context.get(key)
+
+    if df is None or not isinstance(df, pd.DataFrame):
+        print("❌ Error: 'geometry' not found or invalid.")
+        return None
+
+    try:
+
+        for header in XY_headers:
+            df[header]/= XY_Scaler
+
+        for header in elevation_headers:
+            df[header]/= elevation_scaler
+
+        return df
+
+    except Exception as e:
+        print(f"❌ Failed to scale geometry: {e}")
+        return None

@@ -2,10 +2,121 @@ import matplotlib.pyplot as plt
 from matplotlib import gridspec
 import numpy as np
 import pandas as pd
+import io
+import base64
+from IPython.display import HTML, display
 
-def plot_seismic_image(context, xlabel, ylabel, y_spacing, x_header, perc, key="data", xlim=None, ylim=None, figure_dims=(7,9)):
-    data = context.get(key)
-    df = context.get("geometry")
+def plot_acquisition(context, key_acquisition_geometry='acquisition geometry', key_model_geometry='model geometry'):
+    """
+    Plots the acquisition geometry (sources and receivers) and, if available,
+    overlays the model geometry as a polygon.
+
+    Parameters:
+        context (dict): A dictionary that should contain one or both of:
+                        - key_acquisition_geometry: DataFrame with acquisition geometry.
+                        - key_model_geometry: DataFrame with model geometry.
+        key_acquisition_geometry (str): Key in context for acquisition geometry (default 'acquisition geometry').
+        key_model_geometry (str): Key in context for model geometry (default 'model geometry').
+    """
+    # Validate context
+    if context is None or not isinstance(context, dict):
+        print("❌ Error: Invalid context provided.")
+        return
+
+    # Retrieve dataframes from context
+    acq_df = context.get(key_acquisition_geometry)
+    model_df = context.get(key_model_geometry)
+
+    # Check if at least one of the geometry dataframes is available
+    if acq_df is None and model_df is None:
+        print("❌ Error: Neither acquisition geometry nor model geometry found in context.")
+        return
+
+    # Define required column names
+    sx_title = "SourceX"
+    sy_title = "SourceY"
+    gx_title = "GroupX"
+    gy_title = "GroupY"
+
+    plt.figure()
+
+    # Plot acquisition geometry if provided and valid
+    if acq_df is not None:
+        if not isinstance(acq_df, pd.DataFrame):
+            print("❌ Error: Acquisition geometry is not a valid DataFrame.")
+        else:
+            missing_acq = [col for col in [sx_title, sy_title, gx_title, gy_title] if col not in acq_df.columns]
+            if missing_acq:
+                print(f"❌ Error: The following required acquisition columns are missing: {missing_acq}")
+            else:
+                plt.plot(acq_df[sx_title], acq_df[sy_title], 'r*', label='Sources')
+                plt.plot(acq_df[gx_title], acq_df[gy_title], 'b.', label='Receivers')
+
+    # Plot model geometry if provided and valid
+    if model_df is not None:
+        if not isinstance(model_df, pd.DataFrame):
+            print("❌ Error: Model geometry is not a valid DataFrame.")
+        else:
+            missing_model = [col for col in [sx_title, sy_title] if col not in model_df.columns]
+            if missing_model:
+                print(f"❌ Error: The following required model geometry columns are missing: {missing_model}")
+            else:
+                # Compute corner coordinates for a rectangle (polygon)
+                corner_x = [np.min(model_df[sx_title]), np.max(model_df[sx_title]),
+                            np.min(model_df[sx_title]), np.max(model_df[sx_title])]
+                corner_y = [np.min(model_df[sy_title]), np.min(model_df[sy_title]),
+                            np.max(model_df[sy_title]), np.max(model_df[sy_title])]
+                # Plot the four edges of the rectangle
+                plt.plot([corner_x[0], corner_x[1]], [corner_y[0], corner_y[1]], 'g-', label='Model Polygon')
+                plt.plot([corner_x[0], corner_x[2]], [corner_y[0], corner_y[2]], 'g-')
+                plt.plot([corner_x[1], corner_x[3]], [corner_y[1], corner_y[3]], 'g-')
+                plt.plot([corner_x[2], corner_x[3]], [corner_y[2], corner_y[3]], 'g-')
+
+    plt.xlabel("X Coordinate")
+    plt.ylabel("Y Coordinate")
+    plt.title("Acquisition and Model Geometry")
+    plt.legend()
+    display_centered(plt.gcf())
+    # plt.show()
+
+def display_centered(fig):
+    """
+    Saves the given matplotlib figure to a PNG in memory,
+    then displays it centered in the Jupyter Notebook output cell.
+    """
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight')
+    buf.seek(0)
+    img_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+    html = f'<div style="text-align: center;"><img src="data:image/png;base64,{img_b64}"/></div>'
+    display(HTML(html))
+
+def plot_seismic_image(context, xlabel, ylabel, y_spacing, x_header, perc=None, 
+                       key_data="data", key_geometry="geometry", 
+                       xlim=None, ylim=None, figure_dims=(7,9), cmap='gray_r'):
+    """
+    Plots a seismic image based on provided data and geometry.
+    
+    Parameters:
+        context (dict): Contains the data and geometry DataFrame.
+        xlabel (str): Label for the x-axis.
+        ylabel (str): Label for the y-axis.
+        y_spacing (int or float): Spacing multiplier for y-axis.
+        x_header (str): Column name in geometry DataFrame for x-axis values.
+        perc (int or float, optional): Percentile value for symmetric clipping.
+                                       If not provided, vmin and vmax are set to the min and max of the data.
+        key_data (str): Key in context for the seismic data (default "data").
+        key_geometry (str): Key in context for the geometry DataFrame (default "geometry").
+        xlim (tuple, optional): Limits for x-axis.
+        ylim (tuple, optional): Limits for y-axis.
+        figure_dims (tuple): Figure dimensions (width, height) for the plot.
+        cmap (str): Colormap for displaying the seismic image.
+        
+    Returns:
+        None. Displays the seismic image.
+    """
+    data = context.get(key_data)
+    df = context.get(key_geometry)
 
     if data is None or not hasattr(data, "shape"):
         print("❌ Error: 'data' not found or invalid in context.")
@@ -15,9 +126,10 @@ def plot_seismic_image(context, xlabel, ylabel, y_spacing, x_header, perc, key="
         print(f"❌ Error: y_spacing must be a positive number. Got: {y_spacing}")
         return
 
-    if not isinstance(perc, (int, float)) or perc <= 0:
-        print(f"❌ Error: perc must be a positive number. Got: {perc}")
-        return
+    # Verify the colormap is valid
+    if cmap not in plt.colormaps():
+        print(f"❌ Error: Colormap '{cmap}' is not valid. Using default 'gray_r'.")
+        cmap = 'gray_r'
 
     try:
         if data.ndim == 2:
@@ -28,6 +140,7 @@ def plot_seismic_image(context, xlabel, ylabel, y_spacing, x_header, perc, key="
             if x_header not in df.columns:
                 print(f"❌ Error: Column '{x_header}' not found in geometry.")
                 return
+                
 
             num_samples, num_traces = data.shape
             x_values = df[x_header].to_numpy()
@@ -37,11 +150,20 @@ def plot_seismic_image(context, xlabel, ylabel, y_spacing, x_header, perc, key="
                 return
 
             y_values = np.arange(num_samples) * y_spacing
-            clip_value = np.percentile(data, perc)
             extent = [x_values[0], x_values[-1], y_values[-1], y_values[0]]
+            
+            # Determine vmin and vmax based on perc
+            if perc is not None and isinstance(perc, (int, float)) and perc > 0:
+                clip_value = np.percentile(data, perc)
+                vmin = -clip_value
+                vmax = clip_value
+            else:
+                vmin = np.min(data)
+                vmax = np.max(data)
 
             plt.figure(figsize=figure_dims)
-            plt.imshow(data, aspect='auto', cmap='gray_r', vmin=-clip_value, vmax=clip_value, extent=extent)
+            plt.imshow(data, aspect='auto', cmap=cmap, 
+                       vmin=vmin, vmax=vmax, extent=extent, interpolation="bicubic")
             plt.xlabel(xlabel)
             plt.ylabel(ylabel)
             plt.title("Seismic Image")
@@ -53,12 +175,12 @@ def plot_seismic_image(context, xlabel, ylabel, y_spacing, x_header, perc, key="
                 plt.ylim(ylim)
 
             plt.tight_layout()
-            plt.show()
+            display_centered(plt.gcf())
+            # plt.show()
 
         elif data.ndim == 1:
             y = np.arange(len(data)) * y_spacing
 
-            # Use a more compact vertical layout
             plt.figure(figsize=figure_dims)
             plt.plot(data, y, color='black', linewidth=1)
             plt.gca().invert_yaxis()  # Time increases downward
@@ -67,13 +189,11 @@ def plot_seismic_image(context, xlabel, ylabel, y_spacing, x_header, perc, key="
             plt.title("Stacked Seismic Trace")
             plt.grid(True)
 
-            # if xlim:
-            #     plt.xlim(xlim)
             if ylim:
                 plt.ylim(ylim[::-1])  # Reverse because time is vertical
 
             plt.tight_layout()
-            plt.show()
+            display_centered(plt.gcf())
 
         else:
             print(f"❌ Error: 'data' must be 1D or 2D. Got shape: {data.shape}")
