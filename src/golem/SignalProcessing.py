@@ -34,7 +34,8 @@ from .pipeline import (
 from .plotting import (
     plot_seismic_image,
     plot_seismic_comparison_with_trace,
-    plot_spectrum,plot_acquisition
+    plot_spectrum,plot_acquisition,
+    plot_seismic_image_interactive
 )
 
 __all__ = [
@@ -52,5 +53,5 @@ __all__ = [
     "run_pipeline", "print_pipeline_steps",
 
     # Plotting
-    "plot_seismic_image", "plot_seismic_comparison_with_trace", "plot_spectrum", "plot_acquisition"
+    "plot_seismic_image", "plot_seismic_comparison_with_trace", "plot_spectrum", "plot_acquisition", "plot_seismic_image_interactive"
 ]

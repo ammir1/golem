@@ -5,6 +5,7 @@ import pandas as pd
 import io
 import base64
 from IPython.display import HTML, display
+from matplotlib.widgets import Slider
 
 def plot_acquisition(context, key_acquisition_geometry='acquisition geometry', key_model_geometry='model geometry'):
     """
@@ -163,7 +164,7 @@ def plot_seismic_image(context, xlabel, ylabel, y_spacing, x_header, perc=None,
 
             plt.figure(figsize=figure_dims)
             plt.imshow(data, aspect='auto', cmap=cmap, 
-                       vmin=vmin, vmax=vmax, extent=extent, interpolation="bicubic")
+                       vmin=vmin, vmax=vmax, extent=extent, interpolation="none")
             plt.xlabel(xlabel)
             plt.ylabel(ylabel)
             plt.title("Seismic Image")
@@ -175,7 +176,7 @@ def plot_seismic_image(context, xlabel, ylabel, y_spacing, x_header, perc=None,
                 plt.ylim(ylim)
 
             plt.tight_layout()
-            display_centered(plt.gcf())
+            # display_centered(plt.gcf())
             # plt.show()
 
         elif data.ndim == 1:
@@ -193,7 +194,7 @@ def plot_seismic_image(context, xlabel, ylabel, y_spacing, x_header, perc=None,
                 plt.ylim(ylim[::-1])  # Reverse because time is vertical
 
             plt.tight_layout()
-            display_centered(plt.gcf())
+            # display_centered(plt.gcf())
 
         else:
             print(f"❌ Error: 'data' must be 1D or 2D. Got shape: {data.shape}")
@@ -201,7 +202,120 @@ def plot_seismic_image(context, xlabel, ylabel, y_spacing, x_header, perc=None,
     except Exception as e:
         print(f"❌ Failed to plot seismic data: {e}")
 
+def plot_seismic_image_interactive(context, xlabel, ylabel, y_spacing, x_header, sort_header, perc=None, 
+                                   key_data="data", key_geometry="geometry", 
+                                   xlim=None, ylim=None, figure_dims=(7,9), cmap='gray_r'):
+    """
+    Plots a seismic image interactively. The function uses a slider to let the user scroll
+    through each unique value of sort_header from the geometry DataFrame. For each slider position,
+    the seismic data is filtered to show only the traces corresponding to that unique value.
+    
+    Parameters:
+        context (dict): Contains seismic data (2D NumPy array) and a geometry DataFrame.
+        xlabel (str): Label for the x-axis.
+        ylabel (str): Label for the y-axis.
+        y_spacing (float): Spacing multiplier for the y-axis.
+        x_header (str): Column in the geometry DataFrame used for x-axis values.
+        sort_header (str): Column in the geometry DataFrame used for filtering the traces.
+        perc (float, optional): Percentile for symmetric clipping. If provided, vmin and vmax
+                                are set to ±clip_value. Otherwise, min and max of the data are used.
+        key_data (str): Key in context for seismic data (default "data").
+        key_geometry (str): Key in context for the geometry DataFrame (default "geometry").
+        xlim (tuple, optional): x-axis limits.
+        ylim (tuple, optional): y-axis limits.
+        figure_dims (tuple): Figure dimensions (width, height).
+        cmap (str): Colormap to use (must be a valid colormap for plt.imshow).
+        
+    Returns:
+        None. Opens an interactive window.
+    """
+    # Retrieve data and geometry.
+    data = context.get(key_data)
+    df = context.get(key_geometry)
+    
+    if data is None or not hasattr(data, "shape"):
+        print("❌ Error: 'data' not found or invalid in context.")
+        return
+    if df is None or not isinstance(df, pd.DataFrame):
+        print("❌ Error: 'geometry' not found or invalid in context.")
+        return
+    if x_header not in df.columns:
+        print(f"❌ Error: Column '{x_header}' not found in geometry.")
+        return
+    if sort_header not in df.columns:
+        print(f"❌ Error: sort_header '{sort_header}' not found in geometry.")
+        return
+    
+    # Get the unique sorted values for the sort header.
+    unique_vals = np.sort(df[sort_header].unique())
+    
+    # Create the figure and main axis.
+    fig, ax = plt.subplots(figsize=figure_dims)
+    plt.subplots_adjust(bottom=0.15)  # leave space for the slider.
+    
+    # Create a slider below the main axis.
+    slider_ax = fig.add_axes([0.15, 0.05, 0.7, 0.03])
+    slider = Slider(slider_ax, sort_header, 0, len(unique_vals)-1, valinit=0, valfmt='%0.0f')
+    
+    def update_plot(val):
+        idx = int(slider.val)
+        current_val = unique_vals[idx]
+        print(f"Showing {sort_header} = {current_val}")
+        
+        # Filter the geometry for rows matching the current value.
+        sub_df = df[df[sort_header] == current_val]
+        if sub_df.empty:
+            print("No traces for this value.")
+            ax.clear()
+            fig.canvas.draw_idle()
+            return
+        
+        # Assume that each column of data corresponds to a row in sub_df.
+        trace_indices = sub_df.index.to_numpy()
+        sub_data = data[:, trace_indices]
+        num_samples, num_traces = sub_data.shape
+        
+        # Get x-values for the traces from the geometry.
+        x_values = sub_df[x_header].to_numpy()
+        if len(x_values) != num_traces:
+            print("Mismatch in number of traces and x-values.")
+            return
+        
+        # Construct y-values based on sample index and y_spacing.
+        y_values = np.arange(num_samples) * y_spacing
+        
+        # Optionally, you could create an extent. If not, imshow will use array indices.
+        # extent = [x_values[0], x_values[-1], y_values[-1], y_values[0]]
+        
+        if perc is not None and isinstance(perc, (int, float)) and perc > 0:
+            clip_value = np.percentile(sub_data, perc)
+            vmin = -clip_value
+            vmax = clip_value
+        else:
+            vmin = np.min(sub_data)
+            vmax = np.max(sub_data)
+        
+        ax.clear()
+        im = ax.imshow(sub_data, aspect='auto', cmap=cmap, vmin=vmin, vmax=vmax, interpolation="bilinear")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        if xlim:
+            ax.set_xlim(xlim)
+        if ylim:
+            ax.set_ylim(ylim)
+        fig.canvas.draw_idle()
 
+    # Initialize the plot.
+    update_plot(0)
+    
+    slider.on_changed(update_plot)
+    
+    
+    
+    # Use plt.show(block=False) for interactive mode.
+    plt.show(block=False)
+
+    return slider
 
 def plot_seismic_comparison_with_trace(context, key1, key2, xlabel, ylabel, y_spacing, x_header, perc, xlim=None, ylim=None):
     data1 = context.get(key1)
